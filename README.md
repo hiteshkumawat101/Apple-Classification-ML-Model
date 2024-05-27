@@ -1,1 +1,1 @@
-# Apple-Classification-ML-Model-using-KNN-Classifier
+# Apple-Classification-ML-Model
