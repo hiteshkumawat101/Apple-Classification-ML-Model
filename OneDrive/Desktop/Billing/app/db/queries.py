@@ -1,4 +1,4 @@
-import json
+﻿import json
 import logging
 import re
 from datetime import datetime, timezone, timedelta
@@ -9,6 +9,37 @@ from app.db.connection import get_pool, get_dest_pool
 logger = logging.getLogger(__name__)
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _normalize_room_type(room_type: str) -> str:
+    """Normalize user-facing room labels to the DB's operational room key.
+
+    UI/manual inputs often include suffixes like "Room", "Ward", punctuation,
+    or extra spaces ("Deluxe Room", " deluxe-room "). The DB lookup for room
+    pricing is exact-match based, so normalize these common variants first to
+    avoid missing the configured rate and falling back to Gemini's raw room
+    estimate.
+    """
+    normalized = re.sub(r"[\s_-]+", " ", (room_type or "").strip()).lower()
+    normalized = re.sub(r"\b(room|ward)\b", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _room_lookup_candidates(room_type: str) -> tuple[str, str]:
+    """Return both the full normalized label and the base label.
+
+    Example:
+        "Deluxe Room" -> ("deluxe room", "deluxe")
+
+    The DB may store labels with prefixes like room numbers ("306 - Deluxe
+    Room"), while the UI may send just the class name. We therefore keep both
+    forms for matching.
+    """
+    full = re.sub(r"[\s_-]+", " ", (room_type or "").strip()).lower()
+    full = re.sub(r"\s+", " ", full).strip()
+    base = _normalize_room_type(room_type)
+    return full, base
 
 
 async def fetch_patient_by_hr_no(hr_no: str) -> dict | None:
@@ -204,37 +235,80 @@ async def fetch_admission_utilization(ip_id: int, hr_no: str) -> dict:
     }
 
 
-# Flat per-day nursing + doctor-round-visit charge added to every room rate --
-# distinct from the "doctor" bill bucket, which covers consultant/surgical
-# fees, not routine nursing rounds.
-ROOM_NURSING_VISIT_PER_DAY = 3500.0
+async def fetch_room_rate(room_type: str, payment_type: str = "cash") -> float:
+    """Per-day room rate from room_rate_card based on room type and payment type.
 
-
-async def fetch_room_rate(room_type: str) -> float:
-    """Per-day room rate for a room_type: base room charge via room_ward_no
-    (LIKE match), falling back to ac_charges when charges=0 (some room_master
-    rows price AC rooms entirely through ac_charges with charges left at 0),
-    plus the flat nursing/visit charge above. Returns 0 when room_type matches
-    no active room_master row rather than charging the flat fee for a room
-    that doesn't exist.
+    payment_type logic:
+    - "cash": Match on rate_card_name (Hospital)
+    - else (insurance/corporate/government/mediclaim): Match on rate_card.description
     """
     if not room_type:
         return 0.0
+
+    full_room_type, normalized_room_type = _room_lookup_candidates(room_type)
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(
-                """
-                SELECT AVG(CASE WHEN charges = 0 THEN IFNULL(ac_charges, 0) ELSE charges END) AS rate
-                FROM room_master
-                WHERE room_ward_no LIKE %s AND status = 'Active'
-                """,
-                (f"%{room_type}%",),
-            )
+            if payment_type.lower() == "cash":
+                # Match on Hospital rate_card_name
+                await cur.execute(
+                    """
+                    SELECT AVG(CAST(rrc.room_charges AS FLOAT)) AS rate
+                    FROM room_rate_card rrc
+                    JOIN rate_card rc ON rrc.rc_id = rc.rc_id
+                    JOIN room_master rm ON rm.room_id = rrc.room_id
+                    WHERE LOWER(rm.status) = 'active'
+                      AND LOWER(TRIM(rc.rate_card_name)) LIKE CONCAT('%%', %s, '%%')
+                      AND (
+                        LOWER(TRIM(rm.room_ward_no)) = %s
+                        OR LOWER(TRIM(rm.room_type)) = %s
+                        OR REPLACE(REPLACE(LOWER(TRIM(rm.room_ward_no)), ' room', ''), ' ward', '') = %s
+                        OR REPLACE(REPLACE(LOWER(TRIM(rm.room_type)), ' room', ''), ' ward', '') = %s
+                        OR LOWER(TRIM(rm.room_ward_no)) LIKE CONCAT('%%', %s, '%%')
+                        OR LOWER(TRIM(rm.room_type)) LIKE CONCAT('%%', %s, '%%')
+                      )
+                    """,
+                    (
+                        "hospital",
+                        room_type.strip().lower(),
+                        room_type.strip().lower(),
+                        normalized_room_type,
+                        normalized_room_type,
+                        full_room_type,
+                        full_room_type,
+                    ),
+                )
+            else:
+                # Match on description for insurance/corporate/government/mediclaim
+                await cur.execute(
+                    """
+                    SELECT AVG(CAST(rrc.room_charges AS FLOAT)) AS rate
+                    FROM room_rate_card rrc
+                    JOIN rate_card rc ON rrc.rc_id = rc.rc_id
+                    JOIN room_master rm ON rm.room_id = rrc.room_id
+                    WHERE LOWER(rm.status) = 'active'
+                      AND LOWER(TRIM(rc.description)) LIKE CONCAT('%%', %s, '%%')
+                      AND (
+                        LOWER(TRIM(rm.room_ward_no)) = %s
+                        OR LOWER(TRIM(rm.room_type)) = %s
+                        OR REPLACE(REPLACE(LOWER(TRIM(rm.room_ward_no)), ' room', ''), ' ward', '') = %s
+                        OR REPLACE(REPLACE(LOWER(TRIM(rm.room_type)), ' room', ''), ' ward', '') = %s
+                        OR LOWER(TRIM(rm.room_ward_no)) LIKE CONCAT('%%', %s, '%%')
+                        OR LOWER(TRIM(rm.room_type)) LIKE CONCAT('%%', %s, '%%')
+                      )
+                    """,
+                    (
+                        payment_type.strip(),
+                        room_type.strip().lower(),
+                        room_type.strip().lower(),
+                        normalized_room_type,
+                        normalized_room_type,
+                        full_room_type,
+                        full_room_type,
+                    ),
+                )
             row = await cur.fetchone()
-    if not row or row["rate"] is None:
-        return 0.0
-    return float(row["rate"]) + ROOM_NURSING_VISIT_PER_DAY
+            return float(row["rate"]) if row and row["rate"] is not None else 0.0
 
 
 async def fetch_doctor_round_rate(doctor_name: str) -> float:
@@ -560,15 +634,11 @@ COMPONENT_SUPPORT_SAMPLE_LIMIT = 150
 
 # A component counts as "supported" for a diagnosis only if at least this
 # fraction of genuinely diagnosis-matched historical cases carried a charge
-# for it. Checked directly against real data: a bare "did ANY matched case
-# ever show this charge" test is far too weak to be a useful backstop —
-# even Cataract Surgery (n=8) showed a 50% dialysis incidence and Tonsillectomy
-# (n=17) showed 11.8%, almost certainly comorbid patients (e.g. a chronic
-# dialysis patient admitted for elective cataract surgery) rather than
-# contamination. 10% draws the line below that comorbidity-driven noise floor
-# while still catching genuinely near-zero cases (Normal Vaginal Delivery
-# measured at 0%). It's a judgment call, not a statistically derived cutoff.
-COMPONENT_SUPPORT_RATE_THRESHOLD = 0.10
+# for it. 30% threshold filters out cases where 70%+ of patients don't need
+# the component (e.g., only 25% of TKR cases have dialysis due to comorbidities,
+# not the procedure itself). This lets Gemini see the similar cases and make
+# intelligent decisions based on frequency, without needing hardcoded rules.
+COMPONENT_SUPPORT_RATE_THRESHOLD = 0.30
 
 # Below this many matched cases, a rate is too noisy to act on (e.g. 0/3 looks
 # like "zero support" but is just a small sample) — treat as unknown instead.
@@ -719,17 +789,13 @@ def _department_stem(department: str) -> str:
 async def find_similar_cases(patient: dict, limit: int = 10) -> list[dict]:
     """Find similar discharged cases, ranked by match quality.
 
-    Matching strategy (in order):
-    1. Filter by DOCTOR (hard filter on doctor_id or doctor_name)
-    2. Within doctor's cases, filter by:
-       - ALL diagnosis keywords must match (AND) — not OR
-       - Gender must match exactly
-       - Age within ± 10 years
-    3. Rank remaining cases by department, room type, admission type
-    4. If no matches in step 1-3, fall back to cases matching steps 2-3 regardless of doctor
-
-    Multiple diagnoses/departments are supported (comma/semicolon-separated) and
-    are handled as individual keywords in the ALL-matching filter.
+    Diagnosis/procedure keyword overlap is a hard filter (a case must match at
+    least one keyword to be considered at all). Doctor, department and room
+    type are NOT hard filters — they're ranking signals, weighted highest to
+    lowest in that order. Hard-filtering on department (as before) starved the
+    candidate pool for less common diagnoses (as few as 3 matches), which fed
+    the LLM too few reference points; ranking instead of filtering keeps the
+    pool wide while still surfacing the closest matches first.
     """
     pool = await get_pool()
     procedure = patient.get("procedure_done") or patient.get("diagnosis") or ""
@@ -738,158 +804,255 @@ async def find_similar_cases(patient: dict, limit: int = 10) -> list[dict]:
     doctor_id = patient.get("doctor_id")
     doctor_name = patient.get("doctor_name") or ""
     admission_type = patient.get("admission_type") or ""
-    gender = patient.get("gender") or ""
-    age = patient.get("age")
-    patient_ip_id = patient.get("ip_id")
 
-    segments = _extract_diagnosis_segments(procedure)
-    all_keywords = [kw for segment in segments for kw in segment]
+    # ICD codes (admission-window-scoped — see fetch_admission_icd_codes) are
+    # the primary matching signal when available: exact-code matching avoids
+    # the false-positive risk of free-text LIKE substring overlaps. Gated on
+    # emr_diagnosis.hr_no being indexed — without it, the join scans all
+    # 35k+ rows per candidate admission (measured 50s+ on real data). Checked
+    # dynamically so this activates automatically once the index is added,
+    # with no code change needed. Free-text keywords are the fallback both
+    # when there's no emr_diagnosis coverage AND while the index is missing.
+    icd_codes = []
+    if await _emr_diagnosis_hr_no_indexed():
+        icd_codes = await fetch_admission_icd_codes(
+            patient.get("hr_no"), patient.get("admission_date"), patient.get("discharge_date")
+        )
+    segments = [] if icd_codes else _extract_diagnosis_segments(procedure)
+    keywords = [kw for segment in segments for kw in segment]
 
-    logger.info(
-        "find_similar_cases: doctor_id=%s doctor_name=%s diagnosis_keywords=%s gender=%s age=%s "
-        "department=%s room_type=%s admission_type=%s",
-        doctor_id, doctor_name, all_keywords, gender, age, department, room_type, admission_type,
-    )
-
-    base_conditions = ["ia.discharge_date IS NOT NULL", "ia.discharge_date != '0000-00-00'"]
-    base_params = []
-    if patient_ip_id:
-        base_conditions.append("ia.ip_id != %s")
-        base_params.append(patient_ip_id)
-
+    conditions = ["ia.discharge_date IS NOT NULL", "ia.discharge_date != '0000-00-00'"]
+    where_params = []
     score_terms = []
     score_params = []
+    signal_weights = []
+    gating_keywords = []
+
+    use_icd_path = bool(icd_codes)
+    if icd_codes:
+        # Cap to the rarest 4 codes: fewer codes to match keeps the JOIN
+        # tight and the candidate pool small. common codes contribute little
+        # weight anyway.
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute("SELECT COUNT(DISTINCT hr_no) AS c FROM ip_admissions")
+                total_row = await cur.fetchone()
+                total_hr = total_row["c"] if total_row else 0
+                weighted_codes = [(code, await _icd_code_weight(cur, code, total_hr)) for code in icd_codes]
+        weighted_codes.sort(key=lambda x: x[1], reverse=True)
+        weighted_codes = weighted_codes[:4]
+        icd_codes = [code for code, _ in weighted_codes]
+        signal_weights.extend(w for _, w in weighted_codes)
+
+    elif keywords:
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute("SELECT COUNT(*) AS c FROM discharge_summary")
+                total_row = await cur.fetchone()
+                total_cases = total_row["c"] if total_row else 0
+                gating_keywords, weight_by_keyword = await _select_gating_keywords(cur, segments, total_cases)
+
+        if gating_keywords:
+            # avg_signal_weight (drives weak_diagnosis_signal / the doctor-
+            # department boost below) reflects the GATING keywords' specificity
+            # only, not diluted by common comorbidity terms excluded from
+            # gating -- otherwise a single genuinely specific term (e.g.
+            # "Pancreatitis", weight 5.0) gets its own average dragged down
+            # just by ALSO listing common comorbidities, wrongly triggering
+            # the boost and reranking the SAME candidate pool differently
+            # depending on which comorbidities were listed.
+            signal_weights.extend(weight_by_keyword[kw] for kw in gating_keywords)
+
+            like_clauses = " OR ".join(["(ds.diagnosis LIKE %s OR ds.procedure_done LIKE %s)"] * len(gating_keywords))
+            conditions.append(f"({like_clauses})")
+            for kw in gating_keywords:
+                where_params.extend([f"%{kw}%", f"%{kw}%"])
+        else:
+            # EVERY extracted keyword is common (e.g. diagnosis="Acute" alone,
+            # weight 0.3, 27% of all records) -- confirmed on real data that
+            # gating on it anyway still returns 10 "matched" peers dominated
+            # by doctor/department ranking, marked diagnosis_matched=True even
+            # though the "match" carries no real diagnostic signal. Dropping
+            # the keyword filter entirely here (leaving signal_weights empty,
+            # which drives weak_diagnosis_signal=True below) and leaving
+            # has_diagnosis_signal False (see below) treats this exactly like
+            # a genuine no-diagnosis-match: doctor/department/room ranking
+            # only, correctly downgraded confidence.
+            logger.info(
+                "find_similar_cases: every extracted keyword %s is common/generic (none specific "
+                "enough to gate on) -> dropping the keyword filter, doctor/department/room only",
+                keywords,
+            )
+
+        # Only the GATING keywords (the winning segment) score -- confirmed on
+        # real data that scoring non-gating keywords too (e.g. "Diabetes",
+        # "Dyslipidemia" alongside a Coronary Artery Bypass Grafting primary
+        # segment) still swaps out which candidates land inside the LIMIT
+        # cutoff within a large match_score-tied pool (8 of 25 CABG peers
+        # differed with vs. without comorbidities appended, purely from this
+        # scoring nudge), even though they can no longer WIDEN the pool via
+        # gating. Comorbidity text is informational context for Gemini's
+        # prompt, not a peer-matching signal, once it's lost the gating vote.
+        for kw in gating_keywords:
+            weight = weight_by_keyword[kw]
+            score_terms.append(f"(CASE WHEN ds.diagnosis LIKE %s THEN {weight} ELSE 0 END)")
+            score_params.append(f"%{kw}%")
+            score_terms.append(f"(CASE WHEN ds.procedure_done LIKE %s THEN {weight * 0.7} ELSE 0 END)")
+            score_params.append(f"%{kw}%")
+
+    if patient.get("ip_id"):
+        conditions.append("ia.ip_id != %s")
+        where_params.append(patient["ip_id"])
+
+    where_clause = " AND ".join(conditions)
+
+    # When the diagnosis signal is weak (low avg weight — nothing rare/specific
+    # found, ICD-coded or free-text), diagnosis alone can't tell similar cases
+    # apart. Lean harder on doctor/department/admission_type instead of
+    # treating them as minor tiebreakers, since a given doctor in a given
+    # department tends to see a consistent case mix regardless of exactly how
+    # the diagnosis was coded or phrased.
+    avg_signal_weight = sum(signal_weights) / len(signal_weights) if signal_weights else 0
+    weak_diagnosis_signal = avg_signal_weight < 1.5
+    boost = 2.5 if weak_diagnosis_signal else 1.0
+
+    # Under GROUP BY (the ICD aggregating path), these per-admission-constant
+    # terms must be wrapped in MAX() even though they don't vary within a
+    # group — MySQL's ONLY_FULL_GROUP_BY mode (not currently set on this
+    # server, but not guaranteed) rejects non-aggregated columns otherwise.
+    wrap = (lambda expr: f"MAX({expr})") if use_icd_path else (lambda expr: expr)
+
+    if doctor_id:
+        score_terms.append(wrap(f"(CASE WHEN dm.id = %s THEN {10 * boost} ELSE 0 END)"))
+        score_params.append(doctor_id)
+    elif doctor_name:
+        # Substring match, not equality: confirmed on real data that callers
+        # sending a short name ("Dr. Ranjiith") against the full
+        # doctor_master record ("Dr. Ranjiith G. Dhakshina") score ZERO under
+        # exact equality even though it's the same doctor -- this is the
+        # highest-weighted ranking signal (10x boost) and was silently dead for
+        # every abbreviated name tested. Split on comma/slash first so a
+        # dual-role "Dr. A, Dr. B" input matches either.
+        doctor_values = _split_multi_value(doctor_name)
+        if doctor_values:
+            doctor_or = " OR ".join(["LOWER(dm.doctor_name) LIKE LOWER(%s)"] * len(doctor_values))
+            score_terms.append(wrap(f"(CASE WHEN ({doctor_or}) THEN {10 * boost} ELSE 0 END)"))
+            score_params.extend(f"%{dv}%" for dv in doctor_values)
 
     if department:
+        # Stem-based LIKE, not equality: doctor_master.speciality is a full
+        # descriptive phrase ("Traumatology, Joint Replacement & General
+        # Orthopaedics"), never the app's standardized department name
+        # ("Orthopaedics") -- confirmed exact equality scores ZERO for every
+        # doctor checked regardless of what department value is passed,
+        # silently discarding this signal entirely. Split on comma/slash
+        # first so a dual-specialty "Cardiology, Nephrology" input can match
+        # on either department instead of the whole compound string (which
+        # never matches anything).
         dept_stems = [s for s in (_department_stem(dv) for dv in _split_multi_value(department)) if s]
         if dept_stems:
             dept_or = " OR ".join(["LOWER(dm.speciality) LIKE LOWER(%s)"] * len(dept_stems))
-            score_terms.append(f"(CASE WHEN ({dept_or}) THEN 3 ELSE 0 END)")
+            score_terms.append(wrap(f"(CASE WHEN ({dept_or}) THEN {3 * boost} ELSE 0 END)"))
             score_params.extend(f"%{stem}%" for stem in dept_stems)
 
     if admission_type:
-        score_terms.append(f"(CASE WHEN LOWER(ia.admission_type) = LOWER(%s) THEN 4 ELSE 0 END)")
+        # Dialysis Case / Day Case / General have fundamentally different cost
+        # structures — matching within the same admission_type keeps the
+        # comparison meaningful even when diagnosis text alone is thin.
+        score_terms.append(wrap(f"(CASE WHEN LOWER(ia.admission_type) = LOWER(%s) THEN {4 * boost} ELSE 0 END)"))
         score_params.append(admission_type)
 
     if room_type:
         score_terms.append(
-            f"""(CASE WHEN (
-                SELECT ba2.room_type FROM bed_allocations ba2
-                WHERE ba2.ip_id = ia.ip_id
-                ORDER BY ba2.start_date DESC, ba2.ba_id DESC LIMIT 1
-            ) = %s THEN 1 ELSE 0 END)"""
+            wrap(
+                """(CASE WHEN (
+                    SELECT ba2.room_type FROM bed_allocations ba2
+                    WHERE ba2.ip_id = ia.ip_id
+                    ORDER BY ba2.start_date DESC, ba2.ba_id DESC LIMIT 1
+                ) = %s THEN 1 ELSE 0 END)"""
+            )
         )
         score_params.append(room_type)
 
     extra_score_sql = " + ".join(score_terms) if score_terms else "0"
 
-    cases = await _find_similar_cases_with_filters(
-        pool, doctor_id, doctor_name, all_keywords, gender, age,
-        base_conditions, base_params, extra_score_sql, score_params, limit, fallback=True,
+    # Deliberately NOT bool(keywords): when every extracted keyword was common
+    # (gating_keywords empty), no real keyword filter was ever applied, so
+    # this must read as "no diagnosis signal" too, not just "no keywords".
+    has_diagnosis_signal = bool(icd_codes) or bool(gating_keywords)
+
+    logger.info(
+        "find_similar_cases: match_path=%s icd_codes=%s keywords=%s gating_keywords=%s avg_signal_weight=%.2f "
+        "weak_diagnosis_signal=%s doctor_id=%s doctor_name=%s department=%s room_type=%s admission_type=%s",
+        "icd" if use_icd_path else ("keyword" if keywords else "no_diagnosis_signal"),
+        icd_codes, keywords, gating_keywords, avg_signal_weight, weak_diagnosis_signal,
+        doctor_id, doctor_name, department, room_type, admission_type,
     )
 
-    logger.info("find_similar_cases: returned %d case(s) (diagnosis_matched=True for all)", len(cases))
-
-    for case in cases:
-        case["diagnosis_matched"] = bool(all_keywords)
-        case["bills"] = await _fetch_case_bills(case["ip_id"])
-
-    return cases
-
-
-async def _find_similar_cases_with_filters(
-    pool, doctor_id: int | None, doctor_name: str, all_keywords: list[str],
-    gender: str, age: int | None,
-    base_conditions: list[str], base_params: list,
-    extra_score_sql: str, score_params: list,
-    limit: int, fallback: bool = True,
-) -> list[dict]:
-    """Helper to build AND-matched diagnosis + age/gender filters, with doctor as hard filter first.
-    When fallback=True and doctor-filtered results are empty, retries without doctor filter.
-    """
-    conditions = list(base_conditions)
-    params = list(base_params)
-
-    # Diagnosis keyword matching: try AND (all keywords must match) first;
-    # if that yields no results, fallback to OR (at least one keyword).
-    # This keeps strict matching when cases exist, but allows looser matching
-    # for rare diagnoses with many keywords that would otherwise match nothing.
-    diagnosis_and_clause = None
-    diagnosis_or_clause = None
-    diagnosis_and_params = []
-    diagnosis_or_params = []
-
-    if all_keywords:
-        and_clauses = " AND ".join(
-            ["(ds.diagnosis LIKE %s OR ds.procedure_done LIKE %s)"] * len(all_keywords)
+    if use_icd_path:
+        cases = await _execute_icd_case_query(
+            pool, weighted_codes, where_clause, where_params, extra_score_sql, score_params, limit,
         )
-        diagnosis_and_clause = f"({and_clauses})"
-        for kw in all_keywords:
-            diagnosis_and_params.extend([f"%{kw}%", f"%{kw}%"])
+    else:
+        cases = await _execute_case_query(pool, where_clause, where_params, extra_score_sql, score_params, limit)
 
-        or_clauses = " OR ".join(
-            ["(ds.diagnosis LIKE %s OR ds.procedure_done LIKE %s)"] * len(all_keywords)
-        )
-        diagnosis_or_clause = f"({or_clauses})"
-        for kw in all_keywords:
-            diagnosis_or_params.extend([f"%{kw}%", f"%{kw}%"])
-
-    if gender:
-        conditions.append("pp.gender = %s")
-        params.append(gender)
-
-    if age is not None:
-        age_min = age - 10
-        age_max = age + 10
-        # age column stores "66Y 9M" format, extract the year part with CAST(... AS UNSIGNED)
-        conditions.append("CAST(pp.age AS UNSIGNED) BETWEEN %s AND %s")
-        params.extend([age_min, age_max])
-
-    doctor_clauses = []
-    doctor_params = []
-    if doctor_id:
-        doctor_clauses.append("dm.id = %s")
-        doctor_params.append(doctor_id)
-    elif doctor_name:
-        for dv in _split_multi_value(doctor_name):
-            doctor_clauses.append("LOWER(dm.doctor_name) LIKE LOWER(%s)")
-            doctor_params.append(f"%{dv}%")
-
-    where_clause = " AND ".join(conditions)
-
-    # Add doctor filter (hard filter applied before diagnosis matching)
-    if doctor_clauses:
-        doctor_clause = " OR ".join(doctor_clauses)
-        where_clause = f"{where_clause} AND ({doctor_clause})" if where_clause else doctor_clause
-        params = params + doctor_params
-
-    # Add diagnosis matching (OR logic - at least one keyword matches)
-    if diagnosis_or_clause:
-        where_clause = f"{where_clause} AND {diagnosis_or_clause}" if where_clause else diagnosis_or_clause
-        params = params + diagnosis_or_params
-
-    cases = await _execute_case_query(pool, where_clause, params, extra_score_sql, score_params, limit)
     logger.info("find_similar_cases: primary query returned %d case(s)", len(cases))
 
-    if not cases:
-        logger.info("find_similar_cases: no matches with diagnosis filter -> retrying without diagnosis")
-        # Rebuild where_clause and params without diagnosis (keep base, gender, age, doctor)
-        where_clause = " AND ".join(conditions)
-        params_no_diagnosis = list(base_params)
-        if gender:
-            params_no_diagnosis.append(gender)
-        if age is not None:
-            params_no_diagnosis.extend([age - 10, age + 10])
-        if doctor_clauses:
-            doctor_clause = " OR ".join(doctor_clauses)
-            where_clause = f"{where_clause} AND ({doctor_clause})" if where_clause else doctor_clause
-            params_no_diagnosis = params_no_diagnosis + doctor_params
-        cases = await _execute_case_query(pool, where_clause, params_no_diagnosis, extra_score_sql, score_params, limit)
-        logger.info("find_similar_cases: retry without diagnosis returned %d case(s)", len(cases))
+    if cases:
+        for case in cases:
+            case["diagnosis_matched"] = has_diagnosis_signal
+    elif has_diagnosis_signal and (doctor_id or doctor_name or department):
+        logger.info(
+            "find_similar_cases: primary match empty despite diagnosis signal -> "
+            "falling back to doctor/department peer cases (no diagnosis requirement)"
+        )
+        # Diagnosis text matched nothing anywhere in discharge history (e.g. a
+        # rare/oddly-worded diagnosis) — rather than leave the admission-time
+        # estimate empty (Rs.0/confidence:none), fall back to the same doctor's
+        # or department's peer cases with no diagnosis requirement, so there's
+        # still a rough "near" bill to anchor on. These carry no diagnosis
+        # signal, so callers must treat them as lower confidence than a
+        # genuine keyword match (see diagnosis_matched flag below).
+        fallback_conditions = ["ia.discharge_date IS NOT NULL", "ia.discharge_date != '0000-00-00'"]
+        fallback_params = []
+        peer_clauses = []
+        if doctor_id:
+            peer_clauses.append("dm.id = %s")
+            fallback_params.append(doctor_id)
+        elif doctor_name:
+            # Substring match, not equality: callers send short names ("Dr. Mahin")
+            # that are a prefix of the full doctor_master record ("Dr. Mahin
+            # Nallasivam R R") — the same equality trap that starved the
+            # primary department/room filters before they became ranking signals.
+            # Split on comma/slash so a dual-role "Dr. A, Dr. B" input matches either.
+            for dv in _split_multi_value(doctor_name):
+                peer_clauses.append("LOWER(dm.doctor_name) LIKE LOWER(%s)")
+                fallback_params.append(f"%{dv}%")
+        if department:
+            # department free text in doctor_master is inconsistent
+            # ("Cardiologist" vs input "Cardiology", "Orthopedic Surgeon" vs
+            # "Orthopaedics") — match on the first ~6 letters of the primary
+            # word, which bridges common spelling/suffix variants without
+            # requiring an exact label match. Split on comma/slash so a
+            # dual-specialty "Cardiology, Nephrology" input matches on either.
+            for dv in _split_multi_value(department):
+                dept_stem = _department_stem(dv)
+                if dept_stem:
+                    peer_clauses.append("LOWER(dm.speciality) LIKE LOWER(%s)")
+                    fallback_params.append(f"%{dept_stem}%")
+        fallback_conditions.append(f"({' OR '.join(peer_clauses)})")
+        if patient.get("ip_id"):
+            fallback_conditions.append("ia.ip_id != %s")
+            fallback_params.append(patient["ip_id"])
+        fallback_where = " AND ".join(fallback_conditions)
+
+        cases = await _execute_case_query(pool, fallback_where, fallback_params, extra_score_sql, score_params, limit)
+        logger.info("find_similar_cases: fallback query returned %d case(s)", len(cases))
+        for case in cases:
+            case["diagnosis_matched"] = False
 
     # Fetch bill breakdowns for each similar case
     for case in cases:
-        case["diagnosis_matched"] = bool(all_keywords)
         case["bills"] = await _fetch_case_bills(case["ip_id"])
 
     return cases
@@ -1107,3 +1270,77 @@ async def fetch_recent_estimate_by_profile_signature(profile_signature: str, max
             if not row:
                 return None
             return {"request_payload": json.loads(row[0]), "response_payload": json.loads(row[1])}
+
+
+async def fetch_doctor_charges_by_disease(diagnosis_keyword: str = "") -> list[dict]:
+    """Fetch doctor charges analysis grouped by disease.
+
+    Returns: list of dicts with:
+        - diagnosis: primary diagnosis
+        - doctor_name: treating doctor
+        - los_days: length of stay
+        - doctor_total: total doctor charge
+        - doctor_per_day: doctor_total / los_days
+        - patient_age: age of patient
+        - admission_date: when admitted
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            where_clause = ""
+            params = []
+
+            if diagnosis_keyword:
+                where_clause = "AND ds.diagnosis LIKE %s"
+                params = [f"%{diagnosis_keyword}%"]
+
+            await cur.execute(
+                f"""
+                SELECT
+                    ds.diagnosis,
+                    dm.doctor_name,
+                    DATEDIFF(ia.discharge_date, ia.date) AS los_days,
+                    COALESCE(SUM(CASE
+                        WHEN LOWER(TRIM(bpm.category_name)) IN ('consultation', 'doctors surgical fees') THEN a.credit
+                        WHEN a.bp_id IS NULL THEN 0
+                        ELSE 0
+                    END), 0) AS doctor_total,
+                    pp.age AS patient_age,
+                    ia.date AS admission_date,
+                    ia.discharge_date,
+                    pp.patient_name
+                FROM ip_admissions ia
+                JOIN discharge_summary ds ON ds.ip_id = ia.ip_id
+                LEFT JOIN patient_profile pp ON pp.hr_no = ia.hr_no
+                LEFT JOIN doctor_master dm ON dm.id = COALESCE(NULLIF(ia.primary_doctor_id, 0), NULLIF(ia.doctor_id, 0))
+                LEFT JOIN accounts a ON a.ip_id = ia.ip_id AND a.credit > 0
+                LEFT JOIN bill_particular_master bpm ON bpm.bp_id = a.bp_id
+                WHERE ia.discharge_date IS NOT NULL
+                    AND ia.discharge_date != '0000-00-00'
+                    AND DATEDIFF(ia.discharge_date, ia.date) > 0
+                    {where_clause}
+                GROUP BY ia.ip_id, ds.diagnosis, dm.doctor_name, ia.date, ia.discharge_date, pp.age, pp.patient_name
+                ORDER BY ia.discharge_date DESC
+                LIMIT 50
+                """,
+                params,
+            )
+            rows = await cur.fetchall()
+
+    result = []
+    for row in rows:
+        los_days = row.get("los_days") or 1
+        doctor_total = float(row.get("doctor_total") or 0)
+        result.append({
+            "diagnosis": row.get("diagnosis"),
+            "doctor_name": row.get("doctor_name"),
+            "patient_name": row.get("patient_name"),
+            "los_days": los_days,
+            "doctor_total": doctor_total,
+            "doctor_per_day": doctor_total / los_days if los_days > 0 else 0,
+            "patient_age": row.get("patient_age"),
+            "admission_date": str(row.get("admission_date")) if row.get("admission_date") else None,
+            "discharge_date": str(row.get("discharge_date")) if row.get("discharge_date") else None,
+        })
+
+    return result
