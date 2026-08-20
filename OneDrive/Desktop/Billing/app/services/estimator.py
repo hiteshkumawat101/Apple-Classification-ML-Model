@@ -1,4 +1,4 @@
-import hashlib
+﻿import hashlib
 import json
 import logging
 import uuid
@@ -18,9 +18,11 @@ from app.db.queries import (
     fetch_recent_estimate_by_profile_signature,
     fetch_recent_estimate_by_ip_id,
     fetch_diagnosis_component_support,
+    fetch_doctor_charges_by_disease,
 )
 from app.services.prompt_builder import build_estimation_prompt
-from app.services.gemini_client import get_estimation
+from app.services.gemini_client import get_estimation, validate_component_breakdown, validate_components_should_be_zero
+from app.services.component_rules import COMPONENT_RULES, EVIDENCE_KEYWORDS
 from app.models.response import EstimateResponse, BillComponent, ComponentBills
 from app.models.request import InitialEstimateRequest
 
@@ -58,6 +60,7 @@ ANCHOR_BAND = 0.20
 # +/-8% keeps that overlap window to LOS deltas of a day or two, which is an
 # acceptable residual risk clinicians would treat as noise anyway.
 LOS_OVERRIDE_ANCHOR_BAND = 0.08
+LOS_OVERRIDE_FIXED_COMPONENT_BAND = 0.02
 
 
 INTENSITY_RATIO_BOUNDS = (0.5, 2.0)
@@ -95,6 +98,131 @@ DOCTOR_CHANGE_BAND = 0.15
 # fetch_recent_estimate_by_ip_id) keeps day-to-day retriggers a refinement
 # that tracks the growing current_bills/utilization rather than a re-roll.
 HR_NO_RETRIGGER_BAND = 0.15
+
+
+def resolve_component_eligibility(
+    diagnosis: str,
+    utilization: dict | None,
+    component_support: dict | None,
+) -> dict[str, dict]:
+    """Determine eligibility (mandatory/conditional_met/conditional_unmet/not_applicable/unknown)
+    for each component based on the diagnosis, utilization, and historical support data.
+
+    Returns: {bucket: {"status": str, "eligible": bool}}
+    - status: one of "mandatory", "conditional_met", "conditional_unmet", "not_applicable", "unknown"
+    - eligible: True if the component should be charged, False otherwise
+
+    Does not modify prediction or validation state; purely a decision function.
+    """
+    eligibility = {}
+    diagnosis_lower = (diagnosis or "").lower()
+
+    for bucket, rule in COMPONENT_RULES.items():
+        rule_type = rule.get("type")
+
+        if rule_type == "mandatory":
+            eligibility[bucket] = {"status": "mandatory", "eligible": True}
+
+        elif rule_type == "conditional":
+            evidence_keywords = rule.get("evidence", [])
+            has_evidence = False
+
+            # Check diagnosis text for evidence
+            for evidence_name in evidence_keywords:
+                keywords = EVIDENCE_KEYWORDS.get(evidence_name, [])
+                for keyword in keywords:
+                    if keyword.lower() in diagnosis_lower:
+                        has_evidence = True
+                        break
+                if has_evidence:
+                    break
+
+            # Check utilization counters if available
+            if not has_evidence and utilization:
+                for evidence_name in evidence_keywords:
+                    if evidence_name == "ot_procedures_total":
+                        if utilization.get("ot_procedures_total", 0) > 0:
+                            has_evidence = True
+                            break
+                    elif evidence_name == "dialysis_sessions":
+                        if utilization.get("dialysis_sessions", 0) > 0:
+                            has_evidence = True
+                            break
+
+            status = "conditional_met" if has_evidence else "conditional_unmet"
+            eligibility[bucket] = {"status": status, "eligible": has_evidence}
+
+        elif rule_type == "diagnosis_based":
+            if component_support is None:
+                status = "unknown"
+                eligible = True  # preserve "don't suppress on unknown" behavior
+            else:
+                # component_support[bucket] is True (supported) or False (not supported)
+                is_supported = component_support.get(bucket, False)
+                if is_supported:
+                    status = "supported_historically"
+                    eligible = True
+                else:
+                    status = "not_applicable"
+                    eligible = False
+
+            eligibility[bucket] = {"status": status, "eligible": eligible}
+
+        else:
+            eligibility[bucket] = {"status": "unknown", "eligible": True}
+
+    return eligibility
+
+
+def enforce_component_eligibility(
+    prediction: dict,
+    eligibility: dict,
+    context: str,
+) -> dict:
+    """Zero out components marked ineligible and fold their amounts into miscellaneous.
+
+    Preserves the total_bill/hospital_bill invariant: the amount is reclassified,
+    not deleted. Records zeroed components in prediction["_zeroed_components"] for
+    later reference (used in _build_response to prevent re-pricing).
+
+    Returns the modified prediction dict.
+    """
+    if not eligibility:
+        return prediction
+
+    comp = prediction.get("component_bills", {})
+    new_comp = dict(comp)
+    zeroed_components = set(prediction.get("_zeroed_components", set()))
+    reclassified = 0.0
+
+    for bucket in BILL_KEYS:
+        bucket_eligible = eligibility.get(bucket, {}).get("eligible", True)
+        amount = float(comp.get(bucket, 0))
+
+        if not bucket_eligible and amount > 0:
+            status = eligibility.get(bucket, {}).get("status", "unknown")
+            logger.warning(
+                "[%s] enforce_component_eligibility: '%s'=%.2f marked ineligible (status=%s) "
+                "-> moving to miscellaneous",
+                context, bucket, amount, status,
+            )
+            reclassified += amount
+            new_comp[bucket] = 0.0
+            zeroed_components.add(bucket)
+
+    if reclassified <= 0:
+        return prediction
+
+    new_comp["miscellaneous"] = float(new_comp.get("miscellaneous", 0)) + reclassified
+
+    prediction = dict(prediction)
+    prediction["component_bills"] = new_comp
+    prediction["_zeroed_components"] = zeroed_components
+    logger.info(
+        "[%s] enforce_component_eligibility: reclassified Rs.%.2f to miscellaneous, "
+        "zeroed_components=%s", context, reclassified, zeroed_components,
+    )
+    return prediction
 
 
 async def _intensity_ratio(current_ip_id: int, elapsed_days: float, similar_cases: list[dict]) -> float:
@@ -142,6 +270,35 @@ async def _intensity_ratio(current_ip_id: int, elapsed_days: float, similar_case
         len(similar_cases), ratio, bounded_ratio,
     )
     return bounded_ratio
+
+
+async def _calculate_doctor_per_day_from_history(similar_cases: list[dict]) -> float | None:
+	"""Calculate actual doctor fee per day from historical similar cases.
+
+	Uses real billing data to validate/adjust the master rate. Returns the
+	weighted median per-day doctor charge across similar cases.
+	"""
+	doctor_rates = []
+	for case in similar_cases:
+		los = case.get("los_days") or 0
+		if not los or los <= 0:
+			continue
+		doctor_charge = case.get("bills", {}).get("doctor", 0) or 0
+		if doctor_charge > 0:
+			weight = float(case.get("match_score") or 0) + 1
+			per_day = doctor_charge / los
+			doctor_rates.append((per_day, weight))
+
+	if not doctor_rates:
+		logger.info("doctor_per_day_from_history: no similar cases with doctor charges -> using system rate")
+		return None
+
+	per_day_rate = _weighted_median(doctor_rates)
+	logger.info(
+		"doctor_per_day_from_history: calculated from %d cases -> %.2f/day",
+		len(doctor_rates), per_day_rate,
+	)
+	return per_day_rate
 
 
 def _weighted_median(values_and_weights: list[tuple[float, float]]) -> float:
@@ -315,6 +472,47 @@ def _clamp_to_anchor(prediction: dict, anchor: float | None, band: float = ANCHO
     return prediction
 
 
+def _apply_llm_validation(prediction: dict, validation: dict, context: str) -> dict:
+    """Apply LLM validation results to suppress invalid components.
+
+    The validation dict has True/False for each component indicating whether
+    it should be charged for this diagnosis. Components marked False are zeroed
+    out and folded into miscellaneous (same as the component support suppression).
+    """
+    if not validation:
+        logger.info("[%s] llm_validation: no validation result -> skipping", context)
+        return prediction
+
+    comp = prediction.get("component_bills", {})
+    new_comp = dict(comp)
+    reclassified = 0.0
+    any_suppressed = False
+
+    for bucket in BILL_KEYS:
+        is_valid = validation.get(bucket, True)
+        amount = float(comp.get(bucket, 0))
+        if not is_valid and amount > 0:
+            logger.warning(
+                "[%s] llm_validation: '%s'=%.2f marked invalid for this diagnosis "
+                "(LLM reasoning: %s) -> moving to miscellaneous",
+                context, bucket, amount, validation.get("reasoning", ""),
+            )
+            reclassified += amount
+            new_comp[bucket] = 0.0
+            any_suppressed = True
+
+    if not any_suppressed:
+        logger.info("[%s] llm_validation: all components validated as acceptable", context)
+        return prediction
+
+    new_comp["miscellaneous"] = float(new_comp.get("miscellaneous", 0)) + reclassified
+
+    prediction = dict(prediction)
+    prediction["component_bills"] = new_comp
+    logger.info("[%s] llm_validation: reclassified Rs.%.2f to miscellaneous", context, reclassified)
+    return prediction
+
+
 def _suppress_unsupported_components(prediction: dict, support: dict[str, bool] | None, context: str) -> dict:
     """Zero out any component_bills entry the current diagnosis has zero
     historical support for (see fetch_diagnosis_component_support), folding
@@ -411,69 +609,6 @@ def _empty_response(estimate_id: str, estimation_source: str) -> EstimateRespons
     )
 
 
-def _resolve_expected_total_los(
-    prediction: dict, los_days_elapsed: float, los_override_days: float | None,
-) -> float:
-    """Single source of truth for the admission's expected total LOS, shared
-    between _build_response and the deterministic room-rent override so both
-    land on the exact same figure.
-
-    The clinician's own override IS the total LOS, even if it's below
-    elapsed_days — that case correctly floors expected_remaining_los to 0
-    downstream, it's not a contradiction to flag.
-
-    Otherwise, Gemini predicts expected_total_los_days from peer LOS patterns
-    with no hard link to this admission's OWN elapsed_days — observed on a
-    real 12-day-elapsed ICU admission returning expected_total_los_days=8,
-    a self-contradictory "expected to stay less time than already spent"
-    figure the API would otherwise surface as-is. Floor it to what's already
-    elapsed since the patient is still admitted.
-    """
-    if los_override_days is not None:
-        return los_override_days
-    raw_expected_total_los = float(prediction.get("expected_total_los_days", 0))
-    expected_total_los = max(raw_expected_total_los, los_days_elapsed)
-    if expected_total_los != raw_expected_total_los:
-        logger.warning(
-            "expected_total_los_days=%.2f from Gemini is below los_days_elapsed=%.2f "
-            "(patient still admitted) -> floored to %.2f",
-            raw_expected_total_los, los_days_elapsed, expected_total_los,
-        )
-    return expected_total_los
-
-
-async def _apply_deterministic_room_rent(
-    prediction: dict, room_type: str, expected_total_los_days: float, context: str,
-) -> dict:
-    """Room rent is a direct LOS x rate calculation, not an LLM guess (see
-    fetch_room_rate for the per-day formula). Overrides whatever Gemini or
-    the deterministic fallback predicted for the "room" component, folding
-    the difference into hospital_bill/total_bill so they stay consistent
-    with the corrected breakdown. Runs last, after all anchor/retrigger/
-    doctor-change clamping, so none of those bands can pull room rent away
-    from the exact calculated figure.
-    """
-    room_per_day = await fetch_room_rate(room_type)
-    new_room = room_per_day * expected_total_los_days
-
-    comp = dict(prediction.get("component_bills", {}))
-    old_room = float(comp.get("room", 0))
-    delta = new_room - old_room
-    comp["room"] = new_room
-
-    prediction = dict(prediction)
-    prediction["component_bills"] = comp
-    prediction["hospital_bill"] = float(prediction.get("hospital_bill", 0)) + delta
-    prediction["total_bill"] = float(prediction.get("total_bill", 0)) + delta
-
-    logger.info(
-        "[%s] deterministic room rent: room_per_day=%.2f x expected_total_los_days=%.2f = %.2f "
-        "(previous room=%.2f, delta=%.2f folded into hospital_bill/total_bill)",
-        context, room_per_day, expected_total_los_days, new_room, old_room, delta,
-    )
-    return prediction
-
-
 def _build_response(
     estimate_id: str,
     estimation_source: str,
@@ -482,10 +617,34 @@ def _build_response(
     prediction: dict,
     los_days_elapsed: float = 0.0,
     los_override_days: float | None = None,
+    room_per_day: float | None = None,
+    doctor_per_day: float | None = None,
+    similar_cases: list[dict] | None = None,
+    component_support: dict[str, bool] | None = None,
+    eligibility: dict[str, dict] | None = None,
 ) -> EstimateResponse:
-    comp = prediction.get("component_bills", {})
+    comp = dict(prediction.get("component_bills", {}))
 
-    expected_total_los = _resolve_expected_total_los(prediction, los_days_elapsed, los_override_days)
+    if los_override_days is not None:
+        # The clinician's own override IS the total LOS, even if it's below
+        # elapsed_days — that case correctly floors expected_remaining_los to
+        # 0 below, it's not a contradiction to flag.
+        expected_total_los = los_override_days
+    else:
+        # Gemini predicts expected_total_los_days from peer LOS patterns with
+        # no hard link to this admission's OWN elapsed_days — observed on a
+        # real 12-day-elapsed ICU admission returning expected_total_los_days=8,
+        # a self-contradictory "expected to stay less time than already
+        # spent" figure the API would otherwise surface as-is. Floor it to
+        # what's already elapsed since the patient is still admitted.
+        raw_expected_total_los = float(prediction.get("expected_total_los_days", 0))
+        expected_total_los = max(raw_expected_total_los, los_days_elapsed)
+        if expected_total_los != raw_expected_total_los:
+            logger.warning(
+                "expected_total_los_days=%.2f from Gemini is below los_days_elapsed=%.2f "
+                "(patient still admitted) -> floored to %.2f",
+                raw_expected_total_los, los_days_elapsed, expected_total_los,
+            )
     expected_remaining_los = max(expected_total_los - los_days_elapsed, 0)
     current_hospital = sum(float(current_bills.get(k, 0)) for k in BILL_KEYS)
     current_pharmacy = float(current_bills.get("pharmacy", 0))
@@ -494,6 +653,189 @@ def _build_response(
     hospital_final = float(prediction.get("hospital_bill", 0))
     pharmacy_final = float(prediction.get("pharmacy_bill", 0))
     total_final = float(prediction.get("total_bill", 0))
+
+    def _clamp_scalar_band(value: float, anchor: float, band: float) -> float:
+        if anchor <= 0:
+            return value
+        low, high = anchor * (1 - band), anchor * (1 + band)
+        return min(max(value, low), high)
+
+    if similar_cases and expected_total_los > 0:
+        valid_cases = [c for c in similar_cases if c.get("los_days") and c["los_days"] > 0]
+
+        if valid_cases:
+            baseline_los = median([c["los_days"] for c in valid_cases])
+            los_delta = expected_total_los - baseline_los
+
+            def bucket_avg(key: str) -> float:
+                vals = [float(c.get("bills", {}).get(key, 0)) for c in valid_cases]
+                return sum(vals) / len(vals) if vals else 0.0
+
+            def bucket_per_day_avg(key: str) -> float:
+                vals = [
+                    float(c.get("bills", {}).get(key, 0)) / float(c["los_days"])
+                    for c in valid_cases
+                    if c.get("los_days")
+                ]
+                return sum(vals) / len(vals) if vals else 0.0
+
+            system_comp = dict(comp)
+            predicted_comp = {
+                "room": float(comp.get("room", 0)),
+                "doctor": float(comp.get("doctor", 0)),
+                "laboratory": float(comp.get("laboratory", 0)),
+                "radiology": float(comp.get("radiology", 0)),
+                "operating_theatre": float(comp.get("operating_theatre", 0)),
+                "dialysis": float(comp.get("dialysis", 0)),
+                "physiotherapy": float(comp.get("physiotherapy", 0)),
+                "miscellaneous": float(comp.get("miscellaneous", 0)),
+            }
+            predicted_pharmacy = pharmacy_final
+
+            if room_per_day is not None and room_per_day > 0:
+                system_comp["room"] = room_per_day * expected_total_los
+
+            doctor_baseline = bucket_avg("doctor")
+            # Fallback to system rate if peer data missing
+            if doctor_baseline <= 0 and doctor_per_day and doctor_per_day > 0:
+                doctor_baseline = doctor_per_day * expected_total_los
+
+            doctor_variable_rate = (
+                DOCTOR_OVERRIDE_PERCENT * doctor_per_day
+                if doctor_per_day is not None and doctor_per_day > 0
+                else DOCTOR_OVERRIDE_PERCENT * bucket_per_day_avg("doctor")
+            )
+
+            system_comp["doctor"] = max(doctor_baseline + doctor_variable_rate * los_delta, 0.0)
+            lab_baseline = bucket_avg("laboratory")
+            lab_adjusted = lab_baseline + LAB_OVERRIDE_PERCENT * bucket_per_day_avg("laboratory") * los_delta
+            # Cap LOS-driven adjustments at ±40% to prevent extreme values
+            lab_capped = max(min(lab_adjusted, lab_baseline * 1.4), max(lab_baseline * 0.6, 0.0))
+            if lab_adjusted != lab_capped:
+                logger.info(
+                    "[%s] laboratory adjustment capped: baseline=%.2f adjusted=%.2f capped=%.2f",
+                    ctx, lab_baseline, lab_adjusted, lab_capped,
+                )
+            system_comp["laboratory"] = lab_capped
+            # For fixed components (radiology, OT, dialysis): use historical average if eligible,
+            # respecting the eligibility decision from earlier pipeline stages.
+            # This prevents under-prediction when Gemini misses that a diagnosis needs the component,
+            # while honoring explicit zero decisions from validation stages.
+            zeroed_components = prediction.get("_zeroed_components", set())
+            is_radiology_eligible = eligibility.get("radiology", {}).get("eligible", True) if eligibility else (not component_support or component_support.get("radiology", True))
+            if is_radiology_eligible and "radiology" not in zeroed_components:
+                system_comp["radiology"] = max(bucket_avg("radiology"), 0.0)
+            else:
+                system_comp["radiology"] = 0.0
+
+            is_ot_eligible = eligibility.get("operating_theatre", {}).get("eligible", True) if eligibility else (not component_support or component_support.get("operating_theatre", True))
+            if is_ot_eligible and "operating_theatre" not in zeroed_components:
+                system_comp["operating_theatre"] = max(bucket_avg("operating_theatre"), 0.0)
+            else:
+                system_comp["operating_theatre"] = 0.0
+
+            is_dialysis_eligible = eligibility.get("dialysis", {}).get("eligible", True) if eligibility else (not component_support or component_support.get("dialysis", True))
+            if is_dialysis_eligible and "dialysis" not in zeroed_components:
+                system_comp["dialysis"] = max(bucket_avg("dialysis"), 0.0)
+            else:
+                system_comp["dialysis"] = 0.0
+
+            # For variable components, apply LOS adjustment if eligible for this diagnosis.
+            # This prevents under-prediction when Gemini misses that a diagnosis needs the component.
+            is_physio_eligible = eligibility.get("physiotherapy", {}).get("eligible", True) if eligibility else (not component_support or component_support.get("physiotherapy", True))
+            if is_physio_eligible and "physiotherapy" not in zeroed_components:
+                physio_baseline = bucket_avg("physiotherapy")
+                physio_adjusted = physio_baseline + bucket_per_day_avg("physiotherapy") * los_delta
+                # Cap LOS-driven adjustments at ±40% to prevent extreme values
+                physio_capped = max(min(physio_adjusted, physio_baseline * 1.4 if physio_baseline > 0 else physio_adjusted),
+                                    max(physio_baseline * 0.6 if physio_baseline > 0 else 0, 0.0))
+                if physio_adjusted != physio_capped:
+                    logger.info(
+                        "[%s] physiotherapy adjustment capped: baseline=%.2f adjusted=%.2f capped=%.2f",
+                        ctx, physio_baseline, physio_adjusted, physio_capped,
+                    )
+                system_comp["physiotherapy"] = physio_capped
+            else:
+                system_comp["physiotherapy"] = 0.0
+            system_comp["miscellaneous"] = max(
+                bucket_avg("miscellaneous") + bucket_per_day_avg("miscellaneous") * los_delta,
+                0.0,
+            )
+            pharmacy_final = max(
+                bucket_avg("pharmacy") + PHARMACY_OVERRIDE_PERCENT * bucket_per_day_avg("pharmacy") * los_delta,
+                0.0,
+            )
+
+            if los_override_days is not None:
+                fixed_component_anchors = {
+                    "doctor": max(bucket_avg("doctor"), 0.0),
+                    "radiology": max(bucket_avg("radiology"), 0.0),
+                    "operating_theatre": max(bucket_avg("operating_theatre"), 0.0),
+                    "dialysis": max(bucket_avg("dialysis"), 0.0),
+                }
+                for key, anchor in fixed_component_anchors.items():
+                    original = float(system_comp.get(key, 0))
+                    clamped = _clamp_scalar_band(
+                        original, anchor, LOS_OVERRIDE_FIXED_COMPONENT_BAND
+                    )
+                    system_comp[key] = clamped
+                    if clamped != original:
+                        logger.info(
+                            "los_override_fixed_component_guard: component=%s value=%.2f "
+                            "outside +/-%.0f%% of anchor=%.2f -> clamped to %.2f",
+                            key, original, LOS_OVERRIDE_FIXED_COMPONENT_BAND * 100,
+                            anchor, clamped,
+                        )
+
+            for key in BILL_KEYS:
+                system_comp[key] = max(float(system_comp.get(key, 0)), float(current_bills.get(key, 0)))
+
+            pharmacy_final = max(pharmacy_final, current_pharmacy)
+            comp = system_comp
+            hospital_final = sum(float(comp.get(k, 0)) for k in BILL_KEYS)
+            total_final = hospital_final + pharmacy_final
+
+            # Sanity check: component bills should sum to hospital bill
+            component_sum = sum(float(comp.get(k, 0)) for k in BILL_KEYS)
+            if abs(component_sum - hospital_final) > 0.01:  # Allow 1 paisa rounding error
+                logger.warning(
+                    "[%s] component sum (%.2f) does not match hospital_bill (%.2f) - possible data inconsistency",
+                    ctx, component_sum, hospital_final,
+                )
+
+            logger.info(
+                "system_los_component_pricing: baseline_los=%.2f expected_total_los_days=%.2f "
+                "los_delta=%.2f room_per_day=%.2f doctor_per_day=%.2f "
+                "predicted_components=%s predicted_pharmacy=%.2f -> overridden_components=%s overridden_pharmacy=%.2f "
+                "hospital_bill=%.2f total_bill=%.2f",
+                baseline_los, expected_total_los, los_delta,
+                room_per_day or 0.0, doctor_per_day or 0.0,
+                predicted_comp, predicted_pharmacy, comp, pharmacy_final, hospital_final, total_final,
+            )
+        elif room_per_day is not None and room_per_day > 0:
+            predicted_room = float(comp.get("room", 0))
+            system_room_total = room_per_day * expected_total_los
+            comp["room"] = system_room_total
+            hospital_final = hospital_final - predicted_room + system_room_total
+            total_final = hospital_final + pharmacy_final
+            logger.info(
+                "system_room_pricing: expected_total_los_days=%.2f room_per_day=%.2f "
+                "predicted_room=%.2f -> overridden_room=%.2f hospital_bill=%.2f total_bill=%.2f",
+                expected_total_los, room_per_day, predicted_room, system_room_total,
+                hospital_final, total_final,
+            )
+    elif room_per_day is not None and room_per_day > 0 and expected_total_los > 0:
+        predicted_room = float(comp.get("room", 0))
+        system_room_total = room_per_day * expected_total_los
+        comp["room"] = system_room_total
+        hospital_final = hospital_final - predicted_room + system_room_total
+        total_final = hospital_final + pharmacy_final
+        logger.info(
+            "system_room_pricing: expected_total_los_days=%.2f room_per_day=%.2f "
+            "predicted_room=%.2f -> overridden_room=%.2f hospital_bill=%.2f total_bill=%.2f",
+            expected_total_los, room_per_day, predicted_room, system_room_total,
+            hospital_final, total_final,
+        )
 
     def make_component(key: str) -> BillComponent:
         current = float(current_bills.get(key, 0))
@@ -592,6 +934,9 @@ async def estimate_by_hr_no(hr_no: str, prediction_context: str) -> EstimateResp
         logger.warning("[%s] no admission found for hr_no=%s", ctx, hr_no)
         raise ValueError(f"No admission found for HR number: {hr_no}")
     _log_fetched_patient(ctx, hr_no, patient)
+    room_per_day = await fetch_room_rate(patient.get("room_type"), patient.get("payment_type", "cash"))
+    doctor_per_day = await fetch_doctor_round_rate(patient.get("doctor_name"))
+    logger.info("[%s] room_rate_lookup: room_type=%r payment_type=%r room_per_day=%.2f", ctx, patient.get("room_type"), patient.get("payment_type"), room_per_day)
 
     current_bills = await fetch_current_bills(patient["ip_id"])
     _log_current_bills(ctx, current_bills)
@@ -620,6 +965,13 @@ async def estimate_by_hr_no(hr_no: str, prediction_context: str) -> EstimateResp
     los_days_elapsed = (datetime.now(IST).date() - admission_date).days if admission_date else 0.0
     current_total = sum(float(v) for v in current_bills.values())
     logger.info("[%s] los_days_elapsed=%s current_total=%.2f", ctx, los_days_elapsed, current_total)
+
+    historical_doctor_per_day = await _calculate_doctor_per_day_from_history(similar_cases)
+    if historical_doctor_per_day:
+        master_doctor_rate = doctor_per_day
+        doctor_per_day = historical_doctor_per_day
+        logger.info("[%s] doctor_per_day overridden from historical data: %.2f/day (master rate: %.2f)",
+                   ctx, doctor_per_day, master_doctor_rate)
 
     prior_estimate = await fetch_recent_estimate_by_ip_id(patient["ip_id"])
     if prior_estimate is not None:
@@ -650,8 +1002,21 @@ async def estimate_by_hr_no(hr_no: str, prediction_context: str) -> EstimateResp
         _log_prediction(ctx, "deterministic fallback prediction", prediction)
         estimation_source = f"{estimation_source}_fallback"
 
+    validation = await validate_component_breakdown(
+        patient.get("diagnosis") or "",
+        prediction.get("component_bills", {}),
+        {"age": patient.get("age"), "gender": patient.get("gender"), "room_type": patient.get("room_type")},
+    )
+    prediction = _apply_llm_validation(prediction, validation, ctx)
+    _log_prediction(ctx, "after LLM validation", prediction)
+
     component_support = await fetch_diagnosis_component_support(patient.get("diagnosis") or "")
     prediction = _suppress_unsupported_components(prediction, component_support, ctx)
+
+    # Resolve component eligibility (new layer, log-only for now)
+    diagnosis = patient.get("diagnosis") or ""
+    eligibility = resolve_component_eligibility(diagnosis, utilization, component_support)
+    logger.info("[%s] resolved component eligibility: %s", ctx, eligibility)
 
     prediction = _clamp_to_anchor(prediction, anchor)
     _log_prediction(ctx, "final prediction after clamp", prediction)
@@ -681,11 +1046,43 @@ async def estimate_by_hr_no(hr_no: str, prediction_context: str) -> EstimateResp
             prediction = dict(prediction)
             prediction["expected_total_los_days"] = clamped_los
 
-    expected_total_los = _resolve_expected_total_los(prediction, los_days_elapsed, None)
-    prediction = await _apply_deterministic_room_rent(prediction, patient.get("room_type"), expected_total_los, ctx)
-    _log_prediction(ctx, "final prediction after room-rent override", prediction)
+    # Final diagnosis-aware validation: zero out components that don't belong to this diagnosis
+    diagnosis = patient.get("diagnosis") or ""
+    zero_validation = await validate_components_should_be_zero(
+        diagnosis,
+        current_bills,
+        prediction.get("component_bills", {}),
+        {"age": patient.get("age"), "gender": patient.get("gender"), "room_type": patient.get("room_type")},
+    )
+    if zero_validation:
+        comp = dict(prediction.get("component_bills", {}))
+        reclassified_to_misc = 0.0
+        for component, should_be_zero in zero_validation.items():
+            if should_be_zero and component in comp:
+                old_val = float(comp.get(component, 0))
+                if old_val > 0:
+                    # Reclassify to miscellaneous instead of losing the charge
+                    reclassified_to_misc += old_val
+                    comp[component] = 0.0
+                    logger.info(
+                        "[%s] diagnosis_aware_zero: %s=%.2f reclassified to miscellaneous (inappropriate for %s)",
+                        ctx, component, old_val, diagnosis,
+                    )
+        if reclassified_to_misc > 0:
+            comp["miscellaneous"] = float(comp.get("miscellaneous", 0)) + reclassified_to_misc
+        prediction = dict(prediction)
+        prediction["component_bills"] = comp
+        # Recalculate hospital and total bills
+        prediction["hospital_bill"] = sum(float(comp.get(k, 0)) for k in BILL_KEYS)
+        prediction["total_bill"] = prediction["hospital_bill"] + prediction.get("pharmacy_bill", 0)
+        _log_prediction(ctx, "after diagnosis-aware zero validation", prediction)
 
-    response = _build_response(estimate_id, estimation_source, band, current_bills, prediction, los_days_elapsed=los_days_elapsed)
+    response = _build_response(
+        estimate_id, estimation_source, band, current_bills, prediction,
+        los_days_elapsed=los_days_elapsed, room_per_day=room_per_day,
+        doctor_per_day=doctor_per_day, similar_cases=similar_cases,
+        component_support=component_support, eligibility=eligibility,
+    )
     await save_estimate(
         estimate_id, estimation_source,
         {"hr_no": hr_no, "prediction_context": prediction_context},
@@ -758,6 +1155,7 @@ def _peer_average_fallback(
     }
 
 
+DOCTOR_OVERRIDE_PERCENT = 0.25
 LAB_OVERRIDE_PERCENT = 0.25
 PHARMACY_OVERRIDE_PERCENT = 0.5
 
@@ -766,9 +1164,16 @@ async def _los_override_fallback(patient: dict, similar_cases: list[dict], new_l
     """Deterministic Additional Day Cost estimate, used only when Gemini fails to
     return a usable prediction for a LOS-override request:
 
-        Additional Day Cost = Room/day + Doctor-Round/day
+        Additional Day Cost = Room/day + partial Doctor/day
             + 50% of Average Pharmacy/day + 25% of Average Laboratory/day
             + LOS-dependent Other charges/day (physiotherapy + miscellaneous)
+
+    Component LOS behavior:
+        Room              -> fully LOS-sensitive
+        Doctor            -> mostly fixed, lightly LOS-sensitive
+        OT / radiology    -> fixed
+        Lab               -> partially LOS-sensitive
+        Pharmacy          -> partially LOS-sensitive
     """
     valid_cases = [c for c in similar_cases if c.get("los_days") and c["los_days"] > 0]
     baseline_los = median([c["los_days"] for c in valid_cases]) if valid_cases else 1
@@ -782,7 +1187,7 @@ async def _los_override_fallback(patient: dict, similar_cases: list[dict], new_l
         vals = [c["bills"].get(key, 0) / c["los_days"] for c in valid_cases]
         return sum(vals) / len(vals) if vals else 0.0
 
-    room_per_day = await fetch_room_rate(patient.get("room_type"))
+    room_per_day = await fetch_room_rate(patient.get("room_type"), patient.get("payment_type", "cash"))
     doctor_per_day = await fetch_doctor_round_rate(patient.get("doctor_name"))
     pharmacy_per_day = bucket_per_day_avg("pharmacy")
     lab_per_day = bucket_per_day_avg("laboratory")
@@ -791,7 +1196,7 @@ async def _los_override_fallback(patient: dict, similar_cases: list[dict], new_l
 
     additional_day_cost = (
         room_per_day
-        + doctor_per_day
+        + DOCTOR_OVERRIDE_PERCENT * doctor_per_day
         + PHARMACY_OVERRIDE_PERCENT * pharmacy_per_day
         + LAB_OVERRIDE_PERCENT * lab_per_day
         + physio_per_day
@@ -800,7 +1205,7 @@ async def _los_override_fallback(patient: dict, similar_cases: list[dict], new_l
 
     component_bills = {
         "room": bucket_avg("room") + room_per_day * additional_days,
-        "doctor": bucket_avg("doctor") + doctor_per_day * additional_days,
+        "doctor": bucket_avg("doctor") + DOCTOR_OVERRIDE_PERCENT * doctor_per_day * additional_days,
         "laboratory": bucket_avg("laboratory") + LAB_OVERRIDE_PERCENT * lab_per_day * additional_days,
         "radiology": bucket_avg("radiology"),
         "operating_theatre": bucket_avg("operating_theatre"),
@@ -892,6 +1297,9 @@ async def estimate_manual(
     )
     patient = _normalize_manual_patient(payload)
     current_bills: dict = {}
+    room_per_day = await fetch_room_rate(patient.get("room_type"), patient.get("payment_type", "cash"))
+    doctor_per_day = await fetch_doctor_round_rate(patient.get("doctor_name"))
+    logger.info("[%s] room_rate_lookup: room_type=%r payment_type=%r room_per_day=%.2f", ctx, patient.get("room_type"), patient.get("payment_type"), room_per_day)
 
     request_payload = payload.model_dump()
     if los_override_days is not None:
@@ -933,18 +1341,7 @@ async def estimate_manual(
                 payload.doctor_name, DOCTOR_CHANGE_BAND * 100,
             )
 
-    # Try with doctor filter first
     similar_cases = await find_similar_cases(patient, limit=SIMILAR_CASES_ANCHOR_LIMIT)
-    logger.info("[%s] find_similar_cases(with doctor) returned %d cases", ctx, len(similar_cases))
-
-    # If doctor has no cases, retry without doctor filter
-    if not similar_cases and patient.get("doctor_name"):
-        logger.info("[%s] no cases with doctor filter (doctor=%s) -> retrying without doctor", ctx, patient.get("doctor_name"))
-        patient_no_doctor = dict(patient)
-        patient_no_doctor["doctor_name"] = None
-        similar_cases = await find_similar_cases(patient_no_doctor, limit=SIMILAR_CASES_ANCHOR_LIMIT)
-        logger.info("[%s] find_similar_cases(no doctor) returned %d cases", ctx, len(similar_cases))
-
     diagnosis_matched = any(c.get("diagnosis_matched", True) for c in similar_cases) if similar_cases else True
     band = _confidence_band(len(similar_cases), diagnosis_matched)
     _log_similar_cases(ctx, similar_cases, diagnosis_matched, band)
@@ -953,8 +1350,15 @@ async def estimate_manual(
         # DB, and this can combine with the "_fallback" suffix below.
         estimation_source = f"{estimation_source}_pd"
 
+    historical_doctor_per_day = await _calculate_doctor_per_day_from_history(similar_cases)
+    if historical_doctor_per_day:
+        master_doctor_rate = doctor_per_day
+        doctor_per_day = historical_doctor_per_day
+        logger.info("[%s] doctor_per_day overridden from historical data: %.2f/day (master rate: %.2f)",
+                   ctx, doctor_per_day, master_doctor_rate)
+
     if not similar_cases:
-        logger.warning("[%s] still no similar cases after retries -> returning empty response", ctx)
+        logger.warning("[%s] no similar cases at all -> returning empty response", ctx)
         response = _empty_response(estimate_id, estimation_source)
         await save_estimate(
             estimate_id, estimation_source, request_payload, response.model_dump(),
@@ -989,8 +1393,21 @@ async def estimate_manual(
         _log_prediction(ctx, "deterministic fallback prediction", prediction)
         estimation_source = f"{estimation_source}_fallback"
 
+    validation = await validate_component_breakdown(
+        payload.diagnosis,
+        prediction.get("component_bills", {}),
+        {"age": payload.age, "gender": payload.gender, "room_type": payload.room_type},
+    )
+    prediction = _apply_llm_validation(prediction, validation, ctx)
+    _log_prediction(ctx, "after LLM validation", prediction)
+
     component_support = await fetch_diagnosis_component_support(payload.diagnosis)
     prediction = _suppress_unsupported_components(prediction, component_support, ctx)
+
+    # Resolve component eligibility (new layer, log-only for now)
+    # Note: estimate_manual has no live admission, so utilization is None (diagnosis-only evidence)
+    eligibility = resolve_component_eligibility(payload.diagnosis, utilization=None, component_support=component_support)
+    logger.info("[%s] resolved component eligibility: %s", ctx, eligibility)
 
     prediction = _clamp_to_anchor(prediction, anchor, band=clamp_band)
     _log_prediction(ctx, "final prediction after clamp", prediction)
@@ -999,9 +1416,30 @@ async def estimate_manual(
         prediction = _clamp_to_anchor(prediction, doctor_change_anchor, band=DOCTOR_CHANGE_BAND)
         _log_prediction(ctx, "final prediction after doctor-change clamp", prediction)
 
-    expected_total_los = _resolve_expected_total_los(prediction, 0.0, los_override_days)
-    prediction = await _apply_deterministic_room_rent(prediction, payload.room_type, expected_total_los, ctx)
-    _log_prediction(ctx, "final prediction after room-rent override", prediction)
+    # Final diagnosis-aware validation: zero out components that don't belong to this diagnosis
+    zero_validation = await validate_components_should_be_zero(
+        payload.diagnosis,
+        current_bills,
+        prediction.get("component_bills", {}),
+        {"age": payload.age, "gender": payload.gender, "room_type": payload.room_type},
+    )
+    if zero_validation:
+        comp = dict(prediction.get("component_bills", {}))
+        for component, should_be_zero in zero_validation.items():
+            if should_be_zero and component in comp:
+                old_val = comp.get(component, 0)
+                comp[component] = 0.0
+                if old_val > 0:
+                    logger.info(
+                        "[%s] diagnosis_aware_zero: %s=%.2f zeroed out (inappropriate for %s)",
+                        ctx, component, old_val, payload.diagnosis,
+                    )
+        prediction = dict(prediction)
+        prediction["component_bills"] = comp
+        # Recalculate hospital and total bills
+        prediction["hospital_bill"] = sum(float(comp.get(k, 0)) for k in BILL_KEYS)
+        prediction["total_bill"] = prediction["hospital_bill"] + prediction.get("pharmacy_bill", 0)
+        _log_prediction(ctx, "after diagnosis-aware zero validation", prediction)
 
     # LOS is predicted independently of total_bill, so a bill landing inside
     # its band doesn't stop Gemini from swinging the stay length itself (an
@@ -1022,7 +1460,9 @@ async def estimate_manual(
 
     response = _build_response(
         estimate_id, estimation_source, band, current_bills, prediction,
-        los_override_days=los_override_days,
+        los_override_days=los_override_days, room_per_day=room_per_day,
+        doctor_per_day=doctor_per_day, similar_cases=similar_cases,
+        component_support=component_support, eligibility=eligibility,
     )
     await save_estimate(
         estimate_id, estimation_source, request_payload, response.model_dump(),
