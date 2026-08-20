@@ -539,6 +539,87 @@ async def _clamp_los_against_historical(
     return prediction
 
 
+def _clamp_miscellaneous_against_historical(
+    prediction: dict,
+    similar_cases: list[dict] | None,
+    context: str,
+) -> dict:
+    """Sanity check: cap miscellaneous charges at P75 of historical distribution.
+
+    Miscellaneous is a catch-all bucket that tends to grow when component eligibility
+    suppresses unsupported charges and folds them into misc. This prevents misc from
+    inflating 1.8x-2.0x above historical average on cases like Stroke or Pneumonia.
+    """
+    if not similar_cases or not prediction:
+        return prediction
+
+    comp_bills = prediction.get("component_bills", {})
+    misc_amount = comp_bills.get("miscellaneous", {}).get("expected_final", 0) if isinstance(comp_bills.get("miscellaneous"), dict) else 0
+
+    if misc_amount <= 0:
+        return prediction
+
+    # Extract historical miscellaneous from similar cases
+    historical_misc = []
+    for case in similar_cases:
+        bills = case.get("bills", {})
+        if bills.get("miscellaneous") and bills.get("miscellaneous") > 0:
+            historical_misc.append(bills["miscellaneous"])
+
+    if len(historical_misc) < 3:
+        logger.info("[%s] Miscellaneous sanity check skipped: insufficient data (%d cases)", context, len(historical_misc))
+        return prediction
+
+    from statistics import quantiles, median
+
+    misc_median = median(historical_misc)
+    if len(historical_misc) >= 4:
+        percentiles = quantiles(historical_misc, n=4)
+        p75_misc = percentiles[2]
+    else:
+        p75_misc = misc_median * 1.2  # Fallback: median + 20%
+
+    # Cap at P75 if exceeds
+    if misc_amount > p75_misc:
+        excess = misc_amount - p75_misc
+        logger.warning(
+            "[%s] Miscellaneous sanity check: predicted Rs%.0f, "
+            "P75 historical is Rs%.0f. Clamping by Rs%.0f (%.1f%% reduction).",
+            context, misc_amount, p75_misc, excess, (excess / misc_amount) * 100,
+        )
+
+        prediction = dict(prediction)
+        comp_bills = dict(comp_bills)
+
+        # Update miscellaneous
+        if isinstance(comp_bills.get("miscellaneous"), dict):
+            misc_obj = dict(comp_bills["miscellaneous"])
+            misc_obj["expected_final"] = p75_misc
+            comp_bills["miscellaneous"] = misc_obj
+        else:
+            comp_bills["miscellaneous"] = p75_misc
+
+        prediction["component_bills"] = comp_bills
+
+        # Recalculate totals
+        hospital_total = sum(
+            (v.get("expected_final", 0) if isinstance(v, dict) else v)
+            for k, v in comp_bills.items() if k in BILL_KEYS
+        )
+        prediction["hospital_bill"] = hospital_total
+        prediction["total_bill"] = hospital_total + prediction.get("pharmacy_bill", 0)
+
+        logger.info(
+            "[%s] Miscellaneous clamped: Rs%.0f → Rs%.0f. "
+            "Total bill reduced from Rs%.0f to Rs%.0f.",
+            context, misc_amount, p75_misc,
+            misc_amount + (prediction.get("hospital_bill", 0) - hospital_total),
+            prediction.get("total_bill", 0),
+        )
+
+    return prediction
+
+
 def _confidence_band(num_cases: int, diagnosis_matched: bool = True) -> str:
     if num_cases == 0:
         return "none"
@@ -986,6 +1067,10 @@ async def estimate_by_hr_no(hr_no: str, prediction_context: str) -> EstimateResp
     prediction = enforce_component_eligibility(prediction, eligibility, ctx)
     _log_prediction(ctx, "after enforce_component_eligibility (initial)", prediction)
 
+    # Clamp miscellaneous against historical distribution (sanity check)
+    prediction = _clamp_miscellaneous_against_historical(prediction, similar_cases, ctx)
+    _log_prediction(ctx, "after miscellaneous sanity check", prediction)
+
     prediction = _clamp_to_anchor(prediction, anchor)
     _log_prediction(ctx, "final prediction after clamp", prediction)
 
@@ -1348,6 +1433,10 @@ async def estimate_manual(
 
     prediction = enforce_component_eligibility(prediction, eligibility, ctx)
     _log_prediction(ctx, "after enforce_component_eligibility (initial)", prediction)
+
+    # Clamp miscellaneous against historical distribution (sanity check)
+    prediction = _clamp_miscellaneous_against_historical(prediction, similar_cases, ctx)
+    _log_prediction(ctx, "after miscellaneous sanity check", prediction)
 
     prediction = _clamp_to_anchor(prediction, anchor, band=clamp_band)
     _log_prediction(ctx, "final prediction after clamp", prediction)
