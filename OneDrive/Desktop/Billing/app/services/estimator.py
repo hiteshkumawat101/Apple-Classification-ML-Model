@@ -21,7 +21,7 @@ from app.db.queries import (
     fetch_doctor_charges_by_disease,
 )
 from app.services.prompt_builder import build_estimation_prompt
-from app.services.gemini_client import get_estimation, validate_component_breakdown, validate_components_should_be_zero
+from app.services.gemini_client import get_estimation
 from app.services.component_rules import COMPONENT_RULES, EVIDENCE_KEYWORDS
 from app.models.response import EstimateResponse, BillComponent, ComponentBills
 from app.models.request import InitialEstimateRequest
@@ -472,101 +472,6 @@ def _clamp_to_anchor(prediction: dict, anchor: float | None, band: float = ANCHO
     return prediction
 
 
-def _apply_llm_validation(prediction: dict, validation: dict, context: str) -> dict:
-    """Apply LLM validation results to suppress invalid components.
-
-    The validation dict has True/False for each component indicating whether
-    it should be charged for this diagnosis. Components marked False are zeroed
-    out and folded into miscellaneous (same as the component support suppression).
-    """
-    if not validation:
-        logger.info("[%s] llm_validation: no validation result -> skipping", context)
-        return prediction
-
-    comp = prediction.get("component_bills", {})
-    new_comp = dict(comp)
-    reclassified = 0.0
-    any_suppressed = False
-
-    for bucket in BILL_KEYS:
-        is_valid = validation.get(bucket, True)
-        amount = float(comp.get(bucket, 0))
-        if not is_valid and amount > 0:
-            logger.warning(
-                "[%s] llm_validation: '%s'=%.2f marked invalid for this diagnosis "
-                "(LLM reasoning: %s) -> moving to miscellaneous",
-                context, bucket, amount, validation.get("reasoning", ""),
-            )
-            reclassified += amount
-            new_comp[bucket] = 0.0
-            any_suppressed = True
-
-    if not any_suppressed:
-        logger.info("[%s] llm_validation: all components validated as acceptable", context)
-        return prediction
-
-    new_comp["miscellaneous"] = float(new_comp.get("miscellaneous", 0)) + reclassified
-
-    prediction = dict(prediction)
-    prediction["component_bills"] = new_comp
-    logger.info("[%s] llm_validation: reclassified Rs.%.2f to miscellaneous", context, reclassified)
-    return prediction
-
-
-def _suppress_unsupported_components(prediction: dict, support: dict[str, bool] | None, context: str) -> dict:
-    """Zero out any component_bills entry the current diagnosis has zero
-    historical support for (see fetch_diagnosis_component_support), folding
-    the removed amount into "miscellaneous" instead of deleting it --
-    hospital_bill/total_bill stay exactly as Gemini predicted; only the
-    BREAKDOWN changes. Silently subtracting the amount instead would quietly
-    lower the total below what the model actually estimated the patient will
-    be billed, on the assumption the whole charge was pure hallucination --
-    more often it's a real cost Gemini just filed under the wrong bucket
-    (e.g. a miscategorized catheter/consumable charge landing in "dialysis"
-    for a diagnosis that never involves dialysis), so reclassifying to the
-    catch-all bucket preserves the money without endorsing the wrong label.
-
-    Guards against a specific observed failure: find_similar_cases boosts
-    doctor/department matching when the diagnosis signal is weak, which can
-    rank in a peer case whose actual diagnosis is unrelated (e.g. a same-
-    doctor sepsis case surfacing for an "Acute Appendicitis" query) — Gemini
-    then blends that peer's cost pattern in, producing e.g. a non-zero
-    dialysis charge for a diagnosis that never involves dialysis. Checking
-    against a wider diagnosis-only sample (no doctor/department boost) catches
-    this regardless of what the ranked peer pool happened to contain.
-
-    No-op when support is None (unknown — see fetch_diagnosis_component_support's
-    docstring for why that's not treated as "unsupported").
-    """
-    if not support:
-        return prediction
-    comp = prediction.get("component_bills", {})
-    new_comp = dict(comp)
-    reclassified = 0.0
-    for bucket, is_supported in support.items():
-        if bucket == "miscellaneous":
-            continue  # can't reclassify the catch-all bucket into itself
-        amount = float(comp.get(bucket, 0))
-        if not is_supported and amount > 0:
-            logger.warning(
-                "[%s] component_support: '%s'=%.2f has zero historical support for this diagnosis "
-                "(diagnosis-only sample, doctor/department ignored) -> moving to miscellaneous",
-                context, bucket, amount,
-            )
-            reclassified += amount
-            new_comp[bucket] = 0.0
-    if reclassified <= 0:
-        return prediction
-
-    new_comp["miscellaneous"] = float(new_comp.get("miscellaneous", 0)) + reclassified
-
-    prediction = dict(prediction)
-    prediction["component_bills"] = new_comp
-    # hospital_bill/total_bill are unchanged -- the money moved buckets, it
-    # didn't disappear.
-    return prediction
-
-
 def _clamp_los_to_anchor(los_days: float, anchor: float | None, band: float) -> float:
     """Same guard as _clamp_to_anchor but for a bare scalar (expected_total_los_days)
     rather than a bill breakdown — total_bill landing inside its band doesn't
@@ -1002,21 +907,14 @@ async def estimate_by_hr_no(hr_no: str, prediction_context: str) -> EstimateResp
         _log_prediction(ctx, "deterministic fallback prediction", prediction)
         estimation_source = f"{estimation_source}_fallback"
 
-    validation = await validate_component_breakdown(
-        patient.get("diagnosis") or "",
-        prediction.get("component_bills", {}),
-        {"age": patient.get("age"), "gender": patient.get("gender"), "room_type": patient.get("room_type")},
-    )
-    prediction = _apply_llm_validation(prediction, validation, ctx)
-    _log_prediction(ctx, "after LLM validation", prediction)
-
-    component_support = await fetch_diagnosis_component_support(patient.get("diagnosis") or "")
-    prediction = _suppress_unsupported_components(prediction, component_support, ctx)
-
-    # Resolve component eligibility (new layer, log-only for now)
+    # Resolve component eligibility and enforce it upfront
     diagnosis = patient.get("diagnosis") or ""
+    component_support = await fetch_diagnosis_component_support(diagnosis)
     eligibility = resolve_component_eligibility(diagnosis, utilization, component_support)
     logger.info("[%s] resolved component eligibility: %s", ctx, eligibility)
+
+    prediction = enforce_component_eligibility(prediction, eligibility, ctx)
+    _log_prediction(ctx, "after enforce_component_eligibility (initial)", prediction)
 
     prediction = _clamp_to_anchor(prediction, anchor)
     _log_prediction(ctx, "final prediction after clamp", prediction)
@@ -1366,21 +1264,14 @@ async def estimate_manual(
         _log_prediction(ctx, "deterministic fallback prediction", prediction)
         estimation_source = f"{estimation_source}_fallback"
 
-    validation = await validate_component_breakdown(
-        payload.diagnosis,
-        prediction.get("component_bills", {}),
-        {"age": payload.age, "gender": payload.gender, "room_type": payload.room_type},
-    )
-    prediction = _apply_llm_validation(prediction, validation, ctx)
-    _log_prediction(ctx, "after LLM validation", prediction)
-
-    component_support = await fetch_diagnosis_component_support(payload.diagnosis)
-    prediction = _suppress_unsupported_components(prediction, component_support, ctx)
-
-    # Resolve component eligibility (new layer, log-only for now)
+    # Resolve component eligibility and enforce it upfront
     # Note: estimate_manual has no live admission, so utilization is None (diagnosis-only evidence)
+    component_support = await fetch_diagnosis_component_support(payload.diagnosis)
     eligibility = resolve_component_eligibility(payload.diagnosis, utilization=None, component_support=component_support)
     logger.info("[%s] resolved component eligibility: %s", ctx, eligibility)
+
+    prediction = enforce_component_eligibility(prediction, eligibility, ctx)
+    _log_prediction(ctx, "after enforce_component_eligibility (initial)", prediction)
 
     prediction = _clamp_to_anchor(prediction, anchor, band=clamp_band)
     _log_prediction(ctx, "final prediction after clamp", prediction)
