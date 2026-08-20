@@ -485,6 +485,60 @@ def _clamp_los_to_anchor(los_days: float, anchor: float | None, band: float) -> 
     return min(max(los_days, low), high)
 
 
+async def _clamp_los_against_historical(
+    prediction: dict,
+    similar_cases: list[dict] | None,
+    diagnosis: str,
+    context: str,
+) -> dict:
+    """Sanity check: if Gemini's predicted LOS exceeds the P90 of historical similar cases,
+    clamp it to P75 to avoid over-predictions on complex cases like Stroke or Pneumonia.
+
+    This prevents Gemini from predicting 25-30 day stays when historical average is 8-12 days,
+    which inflates room/doctor charges and total bill by 126-138%.
+    """
+    if not similar_cases or not prediction:
+        return prediction
+
+    gemini_los = float(prediction.get("expected_total_los_days", 0))
+    if gemini_los <= 0:
+        return prediction
+
+    # Extract historical LOS from similar cases
+    historical_los = sorted([c.get("los_days") for c in similar_cases if c.get("los_days") and c.get("los_days") > 0])
+
+    if len(historical_los) < 5:
+        logger.info("[%s] LOS sanity check skipped: insufficient historical data (%d cases)", context, len(historical_los))
+        return prediction
+
+    # Calculate P75 and P90
+    from statistics import quantiles
+    percentiles = quantiles(historical_los, n=4)
+    p75_los = percentiles[2]  # 75th percentile
+    p90_idx = int(0.9 * len(historical_los))
+    p90_los = historical_los[p90_idx] if p90_idx < len(historical_los) else historical_los[-1]
+
+    # Check if Gemini LOS exceeds P90 (outlier territory)
+    if gemini_los > p90_los:
+        logger.warning(
+            "[%s] LOS sanity check triggered: Gemini predicted %.1f days, "
+            "but P90 for '%s' is %.1f days (P75=%.1f). Clamping to P75.",
+            context, gemini_los, diagnosis, p90_los, p75_los,
+        )
+        prediction = dict(prediction)
+        prediction["expected_total_los_days"] = p75_los
+
+        # Recalculate affected components
+        # (room, doctor, physiotherapy are LOS-dependent)
+        logger.info(
+            "[%s] LOS clamped: %.1f days → %.1f days (P90=%.1f). "
+            "Room/doctor/physiotherapy charges will be recalculated.",
+            context, gemini_los, p75_los, p90_los,
+        )
+
+    return prediction
+
+
 def _confidence_band(num_cases: int, diagnosis_matched: bool = True) -> str:
     if num_cases == 0:
         return "none"
@@ -629,7 +683,12 @@ def _build_response(
             zeroed_components = prediction.get("_zeroed_components", set())
             is_radiology_eligible = eligibility.get("radiology", {}).get("eligible", True) if eligibility else (not component_support or component_support.get("radiology", True))
             if is_radiology_eligible and "radiology" not in zeroed_components:
-                system_comp["radiology"] = max(bucket_avg("radiology"), 0.0)
+                radiology_baseline = bucket_avg("radiology")
+                # If eligible but similar cases show no radiology charges, use a minimum default
+                # This handles diagnoses where radiology IS needed but peers simply don't have it recorded
+                if radiology_baseline <= 0:
+                    radiology_baseline = 2500.0  # Default minimum radiology charge
+                system_comp["radiology"] = max(radiology_baseline, 0.0)
             else:
                 system_comp["radiology"] = 0.0
 
@@ -650,7 +709,14 @@ def _build_response(
             is_physio_eligible = eligibility.get("physiotherapy", {}).get("eligible", True) if eligibility else (not component_support or component_support.get("physiotherapy", True))
             if is_physio_eligible and "physiotherapy" not in zeroed_components:
                 physio_baseline = bucket_avg("physiotherapy")
-                physio_adjusted = physio_baseline + bucket_per_day_avg("physiotherapy") * los_delta
+                # If eligible but similar cases show no physiotherapy charges, use a minimum default
+                # This handles diagnoses where physiotherapy IS needed but peers simply don't have it recorded
+                if physio_baseline <= 0:
+                    physio_baseline = 1500.0  # Default minimum physiotherapy charge per case
+                physio_per_day = bucket_per_day_avg("physiotherapy")
+                if physio_per_day <= 0:
+                    physio_per_day = 500.0  # Default per-day physiotherapy rate if not in peers
+                physio_adjusted = physio_baseline + physio_per_day * los_delta
                 # Cap LOS-driven adjustments at ±40% to prevent extreme values
                 physio_capped = max(min(physio_adjusted, physio_baseline * 1.4 if physio_baseline > 0 else physio_adjusted),
                                     max(physio_baseline * 0.6 if physio_baseline > 0 else 0, 0.0))
@@ -907,8 +973,12 @@ async def estimate_by_hr_no(hr_no: str, prediction_context: str) -> EstimateResp
         _log_prediction(ctx, "deterministic fallback prediction", prediction)
         estimation_source = f"{estimation_source}_fallback"
 
-    # Resolve component eligibility and enforce it upfront
+    # Clamp LOS against historical distribution (sanity check)
     diagnosis = patient.get("diagnosis") or ""
+    prediction = await _clamp_los_against_historical(prediction, similar_cases, diagnosis, ctx)
+    _log_prediction(ctx, "after LOS sanity check", prediction)
+
+    # Resolve component eligibility and enforce it upfront
     component_support = await fetch_diagnosis_component_support(diagnosis)
     eligibility = resolve_component_eligibility(diagnosis, utilization, component_support)
     logger.info("[%s] resolved component eligibility: %s", ctx, eligibility)
@@ -1263,6 +1333,12 @@ async def estimate_manual(
             prediction = await _los_override_fallback(patient, similar_cases, los_override_days)
         _log_prediction(ctx, "deterministic fallback prediction", prediction)
         estimation_source = f"{estimation_source}_fallback"
+
+    # Clamp LOS against historical distribution (sanity check)
+    # Skip if this is a manual LOS override (user already decided the LOS)
+    if los_override_days is None:
+        prediction = await _clamp_los_against_historical(prediction, similar_cases, payload.diagnosis, ctx)
+        _log_prediction(ctx, "after LOS sanity check", prediction)
 
     # Resolve component eligibility and enforce it upfront
     # Note: estimate_manual has no live admission, so utilization is None (diagnosis-only evidence)
