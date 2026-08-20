@@ -1046,36 +1046,9 @@ async def estimate_by_hr_no(hr_no: str, prediction_context: str) -> EstimateResp
             prediction = dict(prediction)
             prediction["expected_total_los_days"] = clamped_los
 
-    # Final diagnosis-aware validation: zero out components that don't belong to this diagnosis
-    diagnosis = patient.get("diagnosis") or ""
-    zero_validation = await validate_components_should_be_zero(
-        diagnosis,
-        current_bills,
-        prediction.get("component_bills", {}),
-        {"age": patient.get("age"), "gender": patient.get("gender"), "room_type": patient.get("room_type")},
-    )
-    if zero_validation:
-        comp = dict(prediction.get("component_bills", {}))
-        reclassified_to_misc = 0.0
-        for component, should_be_zero in zero_validation.items():
-            if should_be_zero and component in comp:
-                old_val = float(comp.get(component, 0))
-                if old_val > 0:
-                    # Reclassify to miscellaneous instead of losing the charge
-                    reclassified_to_misc += old_val
-                    comp[component] = 0.0
-                    logger.info(
-                        "[%s] diagnosis_aware_zero: %s=%.2f reclassified to miscellaneous (inappropriate for %s)",
-                        ctx, component, old_val, diagnosis,
-                    )
-        if reclassified_to_misc > 0:
-            comp["miscellaneous"] = float(comp.get("miscellaneous", 0)) + reclassified_to_misc
-        prediction = dict(prediction)
-        prediction["component_bills"] = comp
-        # Recalculate hospital and total bills
-        prediction["hospital_bill"] = sum(float(comp.get(k, 0)) for k in BILL_KEYS)
-        prediction["total_bill"] = prediction["hospital_bill"] + prediction.get("pharmacy_bill", 0)
-        _log_prediction(ctx, "after diagnosis-aware zero validation", prediction)
+    # Enforce component eligibility: zero out components that don't belong to this diagnosis
+    prediction = enforce_component_eligibility(prediction, eligibility, ctx)
+    _log_prediction(ctx, "after enforce_component_eligibility", prediction)
 
     response = _build_response(
         estimate_id, estimation_source, band, current_bills, prediction,
@@ -1416,30 +1389,9 @@ async def estimate_manual(
         prediction = _clamp_to_anchor(prediction, doctor_change_anchor, band=DOCTOR_CHANGE_BAND)
         _log_prediction(ctx, "final prediction after doctor-change clamp", prediction)
 
-    # Final diagnosis-aware validation: zero out components that don't belong to this diagnosis
-    zero_validation = await validate_components_should_be_zero(
-        payload.diagnosis,
-        current_bills,
-        prediction.get("component_bills", {}),
-        {"age": payload.age, "gender": payload.gender, "room_type": payload.room_type},
-    )
-    if zero_validation:
-        comp = dict(prediction.get("component_bills", {}))
-        for component, should_be_zero in zero_validation.items():
-            if should_be_zero and component in comp:
-                old_val = comp.get(component, 0)
-                comp[component] = 0.0
-                if old_val > 0:
-                    logger.info(
-                        "[%s] diagnosis_aware_zero: %s=%.2f zeroed out (inappropriate for %s)",
-                        ctx, component, old_val, payload.diagnosis,
-                    )
-        prediction = dict(prediction)
-        prediction["component_bills"] = comp
-        # Recalculate hospital and total bills
-        prediction["hospital_bill"] = sum(float(comp.get(k, 0)) for k in BILL_KEYS)
-        prediction["total_bill"] = prediction["hospital_bill"] + prediction.get("pharmacy_bill", 0)
-        _log_prediction(ctx, "after diagnosis-aware zero validation", prediction)
+    # Enforce component eligibility: zero out components that don't belong to this diagnosis
+    prediction = enforce_component_eligibility(prediction, eligibility, ctx)
+    _log_prediction(ctx, "after enforce_component_eligibility", prediction)
 
     # LOS is predicted independently of total_bill, so a bill landing inside
     # its band doesn't stop Gemini from swinging the stay length itself (an
